@@ -1,0 +1,690 @@
+---
+title: "Vignette for Predicting MIEs with Machine Learning Package (MIEML)"
+Author: "Joseph Bundy"
+Date: 2/17/2022
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 2
+    code_folding: "none"
+---
+
+***
+
+## Module and Library Import
+
+***
+
+<br>
+
+### Source ML functions from R scripts and load libraries
+
+```{r}
+options(stringsAsFactors = FALSE)
+
+#alter this path to match the path of your local MIEML repo
+source("/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/MIEML_snapshot_01/mieml/scripts/ML_functions_rebase.R")
+
+#alter this path to match the path of your local httrpathway repo
+
+#this is optional - and only required for analyses that use pathway scoring 
+
+source("/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/HTTR_repos/httrpathway/R/MYGSEA.R")
+
+library(plyr)
+library(dplyr)
+library(readxl)
+library(rlist)
+library(GSVA)
+```
+
+<br>
+
+***
+## Data integration and pre-processing
+
+The following functions and code describe pre-processing steps in the classifier training pipeline that occur before any actual ML analysis or MIE-specific data partitioning
+
+***
+
+### Import and clean RefChemDB with filter_refchem
+
+The refchem_file argument should correspond to the file path of supplemental table 12 from [Judson et al 2020](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6784312/), converted to .csv format.  This file is included in the repo but the local path is not hard-coded into functions to allow users to specify a their own annotation file if desired.
+
+```{r, message = FALSE}
+REFCHEMDB_FILE_PATH = "/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/refchem_explore/input/refchem.csv"
+
+refchem_filtered<- filter_refchem(refchem_file =  REFCHEMDB_FILE_PATH,
+                                 support_level = 5)
+head(refchem_filtered)
+```
+
+<br>
+
+### Combine MIEs with similar sets of associated chemicals with collapse_targets_static
+
+```{r}
+preprocessed_collapsed_targets <- collapse_targets_static(refchem_file_raw = REFCHEMDB_FILE_PATH,
+                                                        support_levels = c(5),
+                                                        min_chemicals = 5,
+                                                        h = 0.7,
+                                                        method= "complete",
+                                                        write_out = FALSE)
+```
+
+<br>
+
+### Collapsed targets still need to be filtered by support level before further processing - a good default is to remove annotations with a support level less than 5
+
+```{r}
+refchem_collapsed <- preprocessed_collapsed_targets$collapsed_targets
+refchem_collapsed <- refchem_collapsed[refchem_collapsed$support > 4,]
+```
+
+<br>
+
+### Tabulate the number of chemicals available for each target_mode with table_targets()
+
+```{r, message = FALSE, warning = FALSE}
+target_table <- table_targets(refchem_collapsed)
+head(target_table)
+```
+
+<br>
+
+### Import relevant LINCS metadata
+
+This analysis will need to be pointed to a local directory where data from the CMAP LINCS L1000 data are stored. The LINCS_directory path should be set to a drive or network folder where [LINCS Phase 1](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE92742) and [LINCS Phase 2](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE70138) data were downloaded into subfolders titled "phase_1" and "phase_2", respectively. 
+
+```{r}
+LINCS_DIRECTORY = "/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/cmap_explore/input/"
+phase1_cmap_metadata <- data.frame(read.csv(file = paste0(LINCS_DIRECTORY, "phase_1/GSE92742_Broad_LINCS_sig_info.txt"), header = TRUE, sep = "\t"))
+phase2_cmap_metadata <- read.csv(file = paste0(LINCS_DIRECTORY, "phase_2/GSE70138_Broad_LINCS_sig_info.txt"), header = TRUE, sep = "\t")
+
+all_cmap_metadata <- rbind(phase1_cmap_metadata[c(intersect(names(phase1_cmap_metadata), names(phase2_cmap_metadata)))],
+                           phase2_cmap_metadata[c(intersect(names(phase1_cmap_metadata), names(phase2_cmap_metadata)))])
+
+all_cmap_metadata <- data.table(all_cmap_metadata)
+
+all_cmap_metadata <- all_cmap_metadata[all_cmap_metadata$pert_type == "trt_cp"]
+
+cell_by_duration <- data.table(all_cmap_metadata[,.(profiles = length(sig_id)), by = .(cell_id,pert_itime)])
+cell_by_duration <- cell_by_duration[order(cell_by_duration$profiles, decreasing = TRUE),]
+cell_by_duration
+```
+
+```{r}
+cell_by_duration <- data.table(all_cmap_metadata[,.(profiles = length(sig_id)), by = .(cell_id)])
+cell_by_duration <- cell_by_duration[order(cell_by_duration$profiles, decreasing = TRUE),]
+cell_by_duration
+```
+
+<br>
+
+### Import relevant LINCS metadata with ML functions
+
+Specify a DTXSID_INDEX_FILE path.  This file related CMAP LINCS Broad Perturbagen IDs to DTXSIDs.  This file is provided in the MIEML repository under the input subfolder, but this parameter is provided to allow users to point the analysis to a file containing alternative or updated annotations.
+```{r}
+DTXSID_INDEX_FILE = "/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/MIEML_snapshot_01/mieml/input/LINCS_DTXSID_index_9_28_2020.csv"
+
+LINCS_metadata <- import_LINCS_metadata(chemical_manifest = refchem_collapsed,
+                                      cell_id = "MCF7",
+                                      DTXSID_index_file = DTXSID_INDEX_FILE,
+                                      LINCS_directory = LINCS_DIRECTORY)
+
+head(LINCS_metadata)
+```
+
+<br>
+
+### Filter LINCS metadata to such that profiles associated with overrepresented chemicals are trimmed.
+
+The profile_limit parameter specified the maximum number of gene expression profiles that can be associated with a chemical treatment that will be used in classifier training.  Chemicals with a number of associated profiles that is greater than "profile_limit" will have their profiles randomly removed so that their number of associated profiles matches the limit 
+
+```{r}
+LINCS_metadata_trimmed <- trim_LINCS_metadata(LINCS_metadata = LINCS_metadata, 
+                                               seed = 123,
+                                               profile_limit = 20)
+```
+
+<br>
+
+### How many gene expression profiles were removed as a result of trimming?
+```{r}
+nrow(LINCS_metadata)
+nrow(LINCS_metadata_trimmed)
+```
+
+<br>
+
+### Tabulate the number of available LINCS profiles for each target_mode.
+
+Specify minimum cutoffs for the number of chemicals and/or profiles required for the target_mode to be a viable target for prediction
+
+```{r, message = FALSE}
+profile_table <- table_LINCS_profiles(target_table = target_table, 
+                                LINCS_metadata = LINCS_metadata_trimmed, 
+                                chemical_manifest = refchem_collapsed,
+                                min_chemicals = 5,
+                                min_profiles = 50)
+head(profile_table)
+```
+
+<br>
+
+### Select a set of exemplar chemicals
+
+These chemicals are selected for MIEs that we want to train models for.  The purpose of generating this table is to feed it back into the analysis at a later stage so that these chemicals are excluded from classifier training for the purpose of downstream validation.
+
+```{r}
+exemplar_refchems <- fetch_exemplar_refchems_2(chemical_manifest = refchem_collapsed,
+                                     LINCS_metadata = LINCS_metadata_trimmed,
+                                     profile_table = profile_table,
+                                     target_table = target_table,
+                                     min_chemicals = 5,
+                                     min_profiles = 50)
+
+head(exemplar_refchems)  
+```
+
+<br>
+
+### Re-derive the profile table
+
+Include the exemplar chemical table in the exemplar_refchems argument, which will generate new profile totals accounting for the exclusion of these chemicals from training
+
+```{r, message = FALSE}
+profile_table <- table_LINCS_profiles(target_table = target_table, 
+                                LINCS_metadata = LINCS_metadata_trimmed, 
+                                chemical_manifest = refchem_collapsed,
+                                min_chemicals = 5,
+                                min_profiles = 50,
+                                exemplar_refchems = exemplar_refchems)
+head(profile_table)
+```
+
+<br>
+
+### Import LINCS gene expression profiles
+
+```{r, message = FALSE}
+LINCS_matrix <- fetch_LINCS_profiles(LINCS_raw_directory = LINCS_DIRECTORY, 
+                                LINCS_metadata = LINCS_metadata_trimmed)
+```
+
+<br>
+
+### Import LINCS gene info
+
+```{r, message = FALSE}
+gene_info <- data.table(read.csv(header = TRUE, file = paste0(LINCS_DIRECTORY,"phase_1/GSE92742_Broad_LINCS_gene_info.txt"), sep = "\t"))
+head(gene_info)
+```
+
+<br>
+
+### Get complete set of all genes annotated LINCS
+
+```{r}
+genes_in_LINCS <- c()
+for (i in 1:length(gene_info$pr_gene_id)){
+  genes_in_LINCS <- c(genes_in_LINCS, as.character(gene_info[i]$pr_gene_symbol))
+}
+length(genes_in_LINCS)
+```
+
+<br>
+
+### If desired, filter out data associated with inferred genes from the LINCS_matrix object
+
+```{r}
+gene_info_lm <- gene_info[gene_info$pr_is_lm == 1,]
+LINCS_matrix_lm <- LINCS_matrix[,c(as.character(gene_info_lm$pr_gene_id), "sig_id"), with = FALSE]
+```
+
+### Import gsea signatures from downloaded mSigDB file
+```{r}
+sigs <- import_GSEA_signatures("/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/input/c2.cp.v7.1.symbols.txt")
+```
+
+### Calculate size of gsea signatures
+```{r}
+sig_sizes <- table_GSEA_signatures(x = sigs)
+head(sig_sizes)
+```
+
+
+### Get complete set of all genes annotated in this msigDB file
+```{r}
+genes_in_sig <- c()
+for (i in 1:length(sigs)){
+  genes_in_sig <- unique(c(genes_in_sig, c(sigs[[i]])))
+}
+length(genes_in_sig)
+```
+
+### How many genes are represented in both this msigDB set and in the LINCS data (inferred + landmark)?
+```{r}
+length(intersect(genes_in_LINCS, genes_in_sig))
+```
+
+### If desired, we can use MYGSEA to convert gene level signals into pathway scores with these msigDB pathways
+
+Note that this analysis may take some time and is compuationally intensive - modify the cores argument to use more or fewer cores for parallelization
+```{r}
+# Sys.time()
+# pathway_features_mat <- calculate_pathway_scores(LINCS_matrix = LINCS_matrix,
+#                                           LINCS_metadata = LINCS_metadata_trimmed,
+#                                           signature_list = sigs,
+#                                           gene_info = gene_info,
+#                                           cores = 6)
+# Sys.time()
+```
+
+<br>
+
+***
+
+## MIE-wise functions
+
+The following functions are called internally by higher-level MIEML functions (such as train_target, train_targets, ml_job, and ml_analysis), and focus processing / filtering data for specific MIEs
+
+***
+
+
+### Partition training data for a single MIE
+```{r}
+MIE_specific_data <- fetch_LINCS_for_target(seed = 123,
+                                     refchem_file = REFCHEMDB_FILE_PATH,
+                                           target_name = profile_table$target_mode[1],
+                                           exemplar_refchems = exemplar_refchems,
+                                           LINCS_matrix = LINCS_matrix_lm,
+                                           LINCS_metadata = LINCS_metadata_trimmed,
+                                           chemical_manifest = refchem_collapsed,
+                                           null_pred_size = 200)
+```
+
+<br>
+
+### Inspect the top of the metadata table associated with this MIE
+```{r}
+head(MIE_specific_data$LINCS_metadata)
+```
+
+<br>
+
+### Generate a "null" dataset by overriding the generate_noise default of 0
+
+To train "null" classifiers, we must generate a size-matched training data set that contains randomly-selected profiles as opposed to profiles associated with the MIE of interest
+```{r}
+MIE_specific_data_noise <- fetch_LINCS_for_target(seed = 123,
+                                                  refchem_file = REFCHEMDB_FILE_PATH,
+                                           target_name = profile_table$target_mode[1],
+                                           generate_noise = 1,
+                                           exemplar_refchems = exemplar_refchems,
+                                           LINCS_matrix = LINCS_matrix,
+                                           LINCS_metadata = LINCS_metadata_trimmed,
+                                           chemical_manifest = refchem_collapsed,
+                                           null_pred_size = 200)
+```
+
+<br>
+
+### Inspect the top of the "noise" LINCS metadata object
+```{r}
+head(MIE_specific_data_noise$LINCS_metadata)
+```
+
+<br>
+
+***
+
+# High Level Functions
+
+At this point we have everything in memory to train a model using high level MIEML functions
+
+***
+
+<br>
+
+## MIE-specific high level functions
+
+<br>
+
+### Train a model to predict inhibition of ESR using the model_target function
+```{r, message = FALSE}
+ESR1_Negative_model <- model_target(target_name= "ESR1_Negative_group", 
+                               model_names = c("svmLinear", "svmRadial"), 
+                               generate_noise = 0,
+                               support_level = 5,
+                               cell_id = "MCF7",
+                               pert_itime = "no_filter",
+                               feature_opt = "landmark_genes",
+                               LINCS_matrix = LINCS_matrix_lm, 
+                               LINCS_metadata = LINCS_metadata_trimmed,
+                               chemical_manifest = refchem_collapsed,
+                               return_model = TRUE,
+                               verbose = TRUE,
+                               seed = 123,
+                               null_pred_size = 200,
+                               gene_info = gene_info, 
+                               exemplar_refchems = exemplar_refchems,
+                               refchem_file_raw = REFCHEMDB_FILE_PATH,
+                               save_model = FALSE,
+                               output_dir = "../test_output/saved_models")
+
+```
+
+<br>
+
+### Each result is a list of two elements. The first element is simply called "results" and contains a high level summary of the model. The "model_objects" element contains a wealth of information though
+```{r}
+names(ESR1_Negative_model)
+```
+
+### Inspect the names of elements of the model returned by caret
+
+<br>
+
+```{r}
+names(ESR1_Negative_model$model_objects$ESR1_Negative_group_svmLinear)
+```
+
+<br>
+
+### The "variable_importance" element is a dataframe showing the top 200 most important genes to the model
+
+```{r}
+head(ESR1_Negative_model$model_objects$ESR1_Negative_group_svmLinear$variable_importance)
+```
+
+<br>
+
+### Model objects also store prediction results from the top_refchems object - look at the top 6
+
+```{r}
+temp <- ESR1_Negative_model$model_objects$ESR1_Negative_group_svmLinear$top_refchems_predictions
+temp <- temp[order(temp$mean_prediction, decreasing = TRUE),]
+head(temp)
+```
+
+<br>
+
+### The "pred" element is a dataframe that shows the predictions for the "target" portion of the holdout data, along with a number of predictions from random "null" profiles
+
+```{r}
+head(ESR1_Negative_model$model_objects$ESR1_Negative_group_svmLinear$pred)
+```
+
+<br>
+
+### By plotting the predictions from the holdout and expanded null profiles, we get a sense for the model's ability to discriminate between chemicals annotated for the target against it was trained, and a random delection of profiles not associated with the target.
+
+```{r}
+
+temp = ESR1_Negative_model$model_objects$ESR1_Negative_group_svmLinear$pred
+temp = temp[temp$label != "exemplar",]
+
+mu <- ddply(temp, "label", summarise, grp.mean=mean(target))
+
+mu_esr1_negative <- mu
+
+ggplot(data = temp, aes(x = target, fill = label))+
+  geom_area(stat = "bin", alpha = 0.6, binwidth = 0.1)+
+    xlim(0,1)+
+  theme_classic()+
+  xlab(label = "prediction")+
+  geom_vline(data = mu, aes(xintercept = grp.mean, color = label),linetype = "dashed")
+```
+
+<br>
+
+### Generate null models using the permute_models() function
+
+```{r}
+ESR1_null_model <- permute_models(target_name= "ESR1_Negative_group", 
+                                       cores = 2,
+                               model_names = c("svmLinear"), 
+                               seed = 123,
+                               generate_noise = 1,
+                               support_level = 5,
+                               cell_id = "MCF7",
+                               pert_itime = "no_filter",
+                               feature_opt = "landmark_genes",
+                               LINCS_matrix = LINCS_matrix_lm, 
+                               LINCS_metadata = LINCS_metadata_trimmed,
+                               chemical_manifest = refchem_collapsed,
+                               return_model = TRUE,
+                               verbose = FALSE,
+                               null_pred_size = 1,
+                               gene_info = gene_info, 
+                               exemplar_refchems = exemplar_refchems,
+                               refchem_file_raw = REFCHEMDB_FILE_PATH,
+                             iterations = 5)
+```
+
+<br>
+
+### Perform a permutation test for the ESR model
+
+note, this function is not called by any other higher level functions, but is intended to be a stand-alone function for performing a quick test on a single MIE
+
+```{r}
+ESR1_Negative_permutation_test_results <- permutation_test(target_name= "ESR1_Negative_group", 
+                               model_names = c("svmLinear"), 
+                               seed = 123,
+                               support_level = 5,
+                               cell_id = "MCF7",
+                               pert_itime = "no_filter",
+                               feature_opt = "landmark_genes",
+                               LINCS_matrix = LINCS_matrix_lm, 
+                               LINCS_metadata = LINCS_metadata_trimmed,
+                               chemical_manifest = refchem_collapsed,
+                               verbose = FALSE,
+                               gene_info = gene_info, 
+                               exemplar_refchems = exemplar_refchems,
+                               refchem_file_raw = REFCHEMDB_FILE_PATH,
+                             iterations = 50)
+                             
+```
+
+This function returns nested internal and external accuracy scores
+```{r}
+ESR1_Negative_permutation_test_results[[1]]
+```
+
+<br>
+
+### Generate several null models based on this MIE to visualize their performance
+
+```{r, message = FALSE}
+seed = 123
+pred_catch <- data.frame()
+
+for (i in 1:5){
+
+seed = seed + i  
+    
+temp_model <- model_target(target_name= "ESR1_Negative_group", 
+                               model_names = c("svmLinear"), 
+                               generate_noise = 1,
+                               support_level = 5,
+                               cell_id = "MCF7",
+                               pert_itime = "no_filter",
+                               feature_opt = "landmark_genes",
+                               LINCS_matrix = LINCS_matrix_lm, 
+                               LINCS_metadata = LINCS_metadata_trimmed,
+                               chemical_manifest = refchem_collapsed,
+                               return_model = TRUE,
+                               verbose = FALSE,
+                               seed = seed,
+                               null_pred_size = 200,
+                               gene_info = gene_info, 
+                               exemplar_refchems = exemplar_refchems,
+                               refchem_file_raw = REFCHEMDB_FILE_PATH)
+
+
+
+temp = temp_model$model_objects$ESR1_Negative_group_svmLinear$pred
+temp = temp[temp$label != "exemplar",]
+
+mu <- ddply(temp, "label", summarise, grp.mean=mean(target))
+pred_catch <- rbind(pred_catch, mu)
+
+
+print(ggplot(data = temp, aes(x = target, fill = label))+
+  geom_area(stat = "bin", alpha = 0.6, binwidth = 0.1)+
+  xlim(0,1)+
+  theme_classic()+
+  xlab(label = "prediction")+
+  geom_vline(data = mu, aes(xintercept = grp.mean, color = label),linetype = "dashed"))
+
+}
+```
+
+<br>
+
+***
+
+## High level functions for multiple MIEs
+
+These functions allow for model training for multiple MIEs in a single call
+
+***
+
+<br>
+
+
+Instead of training one model at a time, we can alternatively train models against all targets present in a profile_table. Generate a trimmed profile table containing only a few model_targets.
+
+```{r}
+trimmed_profile_table <- tail(profile_table, 2)
+trimmed_profile_table
+```
+
+<br>
+
+### Now, train svmLinear and svmRadial classifiers against these targets
+
+```{r, message = FALSE}
+source("/ccte/projects1/HTTr/HTTr_pipeline_dev/HumanWT_v1/Analysis/Bundy/MIEML_snapshot_01/mieml/scripts/ML_functions_rebase.R")
+
+model_targets_result <-  model_targets(profile_table = trimmed_profile_table, 
+                                 model_names = c("svmLinear", "svmRadial"),
+                                 generate_noise = 0,
+                                 support_level = 5,
+                                 feature_opt = "landmark_genes",
+                                 cell_id = "MCF7",
+                                 pert_itime = "no_filter",
+                                 LINCS_matrix = LINCS_matrix_lm, 
+                                 LINCS_metadata = LINCS_metadata_trimmed,
+                                 chemical_manifest = refchem_collapsed,
+                                 return_model = TRUE,
+                                 verbose = FALSE,
+                                 seed = 123, 
+                                 gene_info = gene_info_lm,
+                                 null_pred_size = 100,
+                                 exemplar_refchems = exemplar_refchems,
+                                 refchem_file_raw = REFCHEMDB_FILE_PATH, 
+                                 save_model = FALSE,
+                                 output_dir = "../test_output/saved_models")
+```
+
+<br>
+
+### Plot target null predictions for each model
+
+```{r}
+for (i in 1:length(model_targets_result)){
+  temp = model_targets_result[[i]][[2]][[1]]$pred
+  
+  temp = temp[temp$label != "exemplar",]
+
+
+mu <- ddply(temp, "label", summarise, grp.mean=mean(target))
+
+print(ggplot(data = temp, aes(x = target, fill = label))+
+  ggtitle(names(model_targets_result)[i])+
+  geom_area(stat = "bin", alpha = 0.6, binwidth = 0.1)+
+  xlim(0,1)+
+  theme_classic()+
+  xlab(label = "prediction")+
+  geom_vline(data = mu, aes(xintercept = grp.mean, color = label),linetype = "dashed"))
+}
+```
+
+<br>
+
+***
+
+## Pipelining functions
+
+These functions are intended to be run in an R script, executed from the command line.  These functions call the majority of the previous functions described in the vignette to preprocess data, train models, and save results.
+
+***
+
+<br>
+
+### ml_job exectures an analysis from start to finish with a single analysis configuration
+
+Only one support level filter, training feature option, or cell_id are accepted
+
+```{r}
+ml_job_result <- ml_job(LINCS_directory = "[INSERT PATH HERE]", 
+                        preprocessed_targets_path = "[INSERT PATH HERE]",
+                        support_level = 5,
+                        generate_noise = 0,
+                        cell_id = "MCF7", 
+                        feature_opt = "landmark_genes",
+                        pert_itime = "no_filter", 
+                        min_chemicals = 0, 
+                        min_profiles = 200, 
+                        model_names = c("svmLinear"), 
+                        cores = 2, 
+                        verbose = TRUE,
+                        return_model = TRUE,
+                        seed = 123,
+                        collapsed_targets = "static",
+                        h = 0.3,
+                        method = "complete",
+                        null_pred_size = 200,
+                        exemplar_refchems_path = "[INSERT PATH HERE]",
+                        profile_limit = 20,
+                        signature_path= "[INSERT PATH HERE]",
+                        save_model = TRUE,
+                        output_dir = "[INSERT PATH HERE]"
+                        
+)
+```
+
+<br>
+
+### The ml_analysis function runs the entire analysis and allows for multiple parameter sets to be tested
+
+This function takes vector arguments for cell_ids, support filters, and training feature opts, and then calls ml_job internally within a loop for each unique combination of options.
+
+```{r}
+ml_analysis(support_levels = c(5,4),
+            pert_itimes = c("no_filter"),
+            cell_ids = c("MCF7"),
+            feature_opts = c("landmark_genes"),
+            refchem_file_raw = "[INSERT PATH HERE]",
+            LINCS_directory = "[INSERT PATH HERE]",
+            min_chemicals = 0,
+            noise_opts = c(0),
+            min_profiles = 200,
+            model_names = c("svmLinear", "svmPoly"),
+            cores = 2,
+            verbose = TRUE,
+            return_model = TRUE,
+            seed = 123,
+            output_dir = "[INSERT PATH HERE]",
+            method = "complete",
+            h = 0.3,
+            collapsed_targets = "static",
+            preprocessed_targets_path = "[INSERT PATH HERE]",
+            null_pred_size = 200,
+            exemplar_refchems_path = "[INSERT PATH HERE]",
+            profile_limit = 20,
+            save_model = TRUE)
+```
